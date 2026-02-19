@@ -1,9 +1,11 @@
 #include <string.h>
 #include <stdio.h>
+#include <stdbool.h>
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "driver/uart.h"
 #include "driver/ledc.h"
 
@@ -13,10 +15,16 @@
 #include <rclc/rclc.h>
 #include <rclc/executor.h>
 
+#include <rmw/rmw.h>
 #include <rmw_microros/rmw_microros.h>
 #include "esp32_serial_transport.h"
 
 #define TOPIC_BUFFER_SIZE 64
+#define UROS_RECONNECT_DELAY_MS 500
+#define UROS_PING_TIMEOUT_MS 100
+#define UROS_PING_ATTEMPTS 1
+#define UROS_PING_INTERVAL_MS 1000
+#define UROS_EXECUTOR_WAIT_MS 10
 
 #define GRIPPER_MAX_WIDTH 0.05f // m
 #define GRIPPER_OPEN_SERVO_ANGLE 170
@@ -27,31 +35,83 @@
 #define SERVO_MAX_PULSEWIDTH_US (2500)
 #define SERVO_MAX_DEGREE (180)
 
-#define RCCHECK(fn)                                                                           \
-    {                                                                                         \
-        rcl_ret_t temp_rc = fn;                                                               \
-        if ((temp_rc != RCL_RET_OK))                                                          \
-        {                                                                                     \
-            ESP_LOGE(TAG, "Failed status on line %d: %d. Retrying.", __LINE__, (int)temp_rc); \
-            taskYIELD();                                                                      \
-            goto try_uros_task;                                                               \
-        }                                                                                     \
-    }
-#define RCSOFTCHECK(fn)                                                                         \
-    {                                                                                           \
-        rcl_ret_t temp_rc = fn;                                                                 \
-        if ((temp_rc != RCL_RET_OK))                                                            \
-        {                                                                                       \
-            ESP_LOGE(TAG, "Failed status on line %d: %d. Continuing.", __LINE__, (int)temp_rc); \
-        }                                                                                       \
-    }
-
 rcl_subscription_t command_subscriber;
 std_msgs__msg__Float32 command_subscriber_msg;
 char command_subscriber_topic[TOPIC_BUFFER_SIZE];
 
 static const char *TAG = "Gripper";
 static size_t uart_port = UART_NUM_0;
+
+void command_subscriber_callback(const void *msgin);
+
+typedef enum
+{
+    WAITING_AGENT,
+    AGENT_AVAILABLE,
+    AGENT_CONNECTED,
+    AGENT_DISCONNECTED
+} uros_state_t;
+
+static bool create_micro_ros_entities(
+    rcl_allocator_t *allocator,
+    rclc_support_t *support,
+    rcl_node_t *node,
+    rclc_executor_t *executor)
+{
+    rcl_ret_t rc;
+
+    rc = rclc_support_init(support, 0, NULL, allocator);
+    if (rc != RCL_RET_OK)
+    {
+        return false;
+    }
+
+    rc = rclc_node_init_default(node, "gripper", "", support);
+    if (rc != RCL_RET_OK)
+    {
+        return false;
+    }
+
+    rc = rclc_subscription_init_best_effort(
+        &command_subscriber,
+        node,
+        ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, Float32),
+        command_subscriber_topic);
+    if (rc != RCL_RET_OK)
+    {
+        return false;
+    }
+
+    rc = rclc_executor_init(executor, &support->context, 1, allocator);
+    if (rc != RCL_RET_OK)
+    {
+        return false;
+    }
+
+    rc = rclc_executor_add_subscription(
+        executor,
+        &command_subscriber,
+        &command_subscriber_msg,
+        command_subscriber_callback,
+        ON_NEW_DATA);
+    if (rc != RCL_RET_OK)
+    {
+        return false;
+    }
+
+    return true;
+}
+
+static void destroy_micro_ros_entities(
+    rclc_support_t *support,
+    rcl_node_t *node,
+    rclc_executor_t *executor)
+{
+    rclc_executor_fini(executor);
+    rcl_subscription_fini(&command_subscriber, node);
+    rcl_node_fini(node);
+    rclc_support_fini(support);
+}
 
 void servo_init()
 {
@@ -113,37 +173,89 @@ void command_subscriber_callback(const void *msgin)
 
 void uros_task(void *arg)
 {
-try_uros_task:
+    (void)arg;
     rcl_allocator_t allocator = rcl_get_default_allocator();
-    rclc_support_t support;
+    uros_state_t state = WAITING_AGENT;
+    int64_t last_ping_check_us = 0;
 
-    // create init_options
-    RCCHECK(rclc_support_init(&support, 0, NULL, &allocator));
+    rclc_support_t support = (rclc_support_t){0};
+    rcl_node_t node = rcl_get_zero_initialized_node();
+    rclc_executor_t executor = rclc_executor_get_zero_initialized_executor();
+    command_subscriber = rcl_get_zero_initialized_subscription();
 
-    // create node
-    rcl_node_t node;
-    RCCHECK(rclc_node_init_default(&node, "Gripper", "", &support));
+    for (;;)
+    {
+        switch (state)
+        {
+        case WAITING_AGENT:
+            if (rmw_uros_ping_agent(UROS_PING_TIMEOUT_MS, UROS_PING_ATTEMPTS) == RMW_RET_OK)
+            {
+                state = AGENT_AVAILABLE;
+            }
+            else
+            {
+                vTaskDelay(pdMS_TO_TICKS(UROS_RECONNECT_DELAY_MS));
+            }
+            break;
 
-    // create subscriber
-    RCCHECK(rclc_subscription_init_default(
-        &command_subscriber,
-        &node,
-        ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, Float32),
-        command_subscriber_topic));
+        case AGENT_AVAILABLE:
+            support = (rclc_support_t){0};
+            node = rcl_get_zero_initialized_node();
+            executor = rclc_executor_get_zero_initialized_executor();
+            command_subscriber = rcl_get_zero_initialized_subscription();
 
-    // create executor
-    rclc_executor_t executor;
-    RCCHECK(rclc_executor_init(&executor, &support.context, 1, &allocator));
+            if (create_micro_ros_entities(&allocator, &support, &node, &executor))
+            {
+                state = AGENT_CONNECTED;
+                last_ping_check_us = esp_timer_get_time();
+                ESP_LOGI(TAG, "Agent connected");
+            }
+            else
+            {
+                ESP_LOGW(TAG, "Entity creation failed, retrying...");
+                destroy_micro_ros_entities(&support, &node, &executor);
+                state = WAITING_AGENT;
+                vTaskDelay(pdMS_TO_TICKS(UROS_RECONNECT_DELAY_MS));
+            }
+            break;
 
-    // add subscriber to executor
-    RCCHECK(rclc_executor_add_subscription(
-        &executor,
-        &command_subscriber,
-        &command_subscriber_msg,
-        command_subscriber_callback,
-        ON_NEW_DATA));
+        case AGENT_CONNECTED:
+            if (rclc_executor_spin_some(&executor, RCL_MS_TO_NS(UROS_EXECUTOR_WAIT_MS)) != RCL_RET_OK)
+            {
+                state = AGENT_DISCONNECTED;
+                break;
+            }
 
-    rclc_executor_spin(&executor);
+            if ((esp_timer_get_time() - last_ping_check_us) >= (UROS_PING_INTERVAL_MS * 1000LL))
+            {
+                if (rmw_uros_ping_agent(UROS_PING_TIMEOUT_MS, UROS_PING_ATTEMPTS) != RMW_RET_OK)
+                {
+                    state = AGENT_DISCONNECTED;
+                    break;
+                }
+                last_ping_check_us = esp_timer_get_time();
+            }
+
+            vTaskDelay(pdMS_TO_TICKS(1));
+            break;
+
+        case AGENT_DISCONNECTED:
+            ESP_LOGW(TAG, "Agent disconnected, destroying entities...");
+            rmw_context_t *rmw_context = rcl_context_get_rmw_context(&support.context);
+            if (rmw_context != NULL)
+            {
+                (void)rmw_uros_set_context_entity_destroy_session_timeout(rmw_context, 0);
+            }
+            destroy_micro_ros_entities(&support, &node, &executor);
+            state = WAITING_AGENT;
+            vTaskDelay(pdMS_TO_TICKS(UROS_RECONNECT_DELAY_MS));
+            break;
+
+        default:
+            state = WAITING_AGENT;
+            break;
+        }
+    }
 }
 
 void app_main(void)
