@@ -26,11 +26,11 @@
 #define UROS_PING_INTERVAL_MS 1000
 #define UROS_EXECUTOR_WAIT_MS 10
 
-#define GRIPPER_MAX_WIDTH 0.05f // m
-#define GRIPPER_OPEN_SERVO_ANGLE 170
-#define GRIPPER_CLOSED_SERVO_ANGLE 0
+#define GRIPPER_MAX_WIDTH 0.045f // m
+#define GRIPPER_SERVO_ANGLE_A 170
+#define GRIPPER_SERVO_ANGLE_B 10
 
-#define SERVO_PWM_GPIO 1
+#define SERVO_PWM_GPIO 4
 #define SERVO_MIN_PULSEWIDTH_US (500)
 #define SERVO_MAX_PULSEWIDTH_US (2500)
 #define SERVO_MAX_DEGREE (180)
@@ -167,7 +167,8 @@ void command_subscriber_callback(const void *msgin)
         pos = 0;
     }
 
-    int angle = GRIPPER_OPEN_SERVO_ANGLE + (pos / GRIPPER_MAX_WIDTH) * (GRIPPER_CLOSED_SERVO_ANGLE - GRIPPER_OPEN_SERVO_ANGLE);
+    int angle = GRIPPER_SERVO_ANGLE_A + (pos / GRIPPER_MAX_WIDTH) * (GRIPPER_SERVO_ANGLE_B - GRIPPER_SERVO_ANGLE_A);
+    ESP_LOGI(TAG, "Received command: %f, setting angle to: %d", pos, angle);
     servo_write_angle(angle);
 }
 
